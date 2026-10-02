@@ -103,12 +103,12 @@
         </div>
         <div class="min-w-0">
           <h1 class="text-xl sm:text-2xl font-extrabold tracking-tight truncate">התקציב שלי – אריאל אורגד</h1>
-          <p class="text-xs text-slate-500 dark:text-slate-400 truncate"><span id="syncPillMobile" class="sm:hidden"></span><span class="hidden sm:inline">הכנסות · הוצאות · אשראי · השקעות ויעדים</span></p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 truncate"><button type="button" id="syncPillMobile" class="sm:hidden"></button><span class="hidden sm:inline">הכנסות · הוצאות · אשראי · השקעות ויעדים</span></p>
         </div>
       </div>
 
       <div class="flex items-center gap-1 sm:gap-2">
-        <span id="syncPill" class="hidden sm:inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 dark:bg-white/10 dark:text-slate-300" title="מצב סנכרון" role="status"></span>
+        <button type="button" id="syncPill" class="hidden sm:inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-white/10 dark:text-slate-300 dark:hover:bg-white/15 transition" title="מצב סנכרון · לחצו לסנכרון עכשיו" aria-live="polite"></button>
         <button id="themeToggle" class="icon-btn" aria-label="החלפת מצב כהה/בהיר" title="מצב כהה/בהיר">
           <span data-icon="moon" class="dark:hidden"></span>
           <span data-icon="sun" class="hidden dark:inline"></span>
@@ -132,6 +132,17 @@
         </button>
       </div>
     </header>
+
+    <!-- אזהרה: מצב ללא סנכרון -->
+    <div id="localBanner" class="hidden mb-4 rounded-2xl border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200 p-4 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+      <div class="text-sm leading-relaxed">
+        <b>⚠️ הנתונים כאן לא מסתנכרנים.</b>
+        מה שתזין בעמוד הזה יישמר רק בדפדפן הזה. לסנכרון בין המחשב לטלפון, עבוד עם
+        <a href="https://claude.ai/artifact/ExBUBRhzw4fcf2t1fZ7aM8" target="_blank" rel="noopener" class="font-bold underline">האפליקציה המסונכרנת ב-Claude</a>.
+        יש כאן נתונים? ייצא אותם וייבא שם.
+      </div>
+      <button type="button" id="bannerExport" class="btn btn-ghost btn-sm shrink-0 !bg-white dark:!bg-white/10">ייצוא הנתונים להעברה</button>
+    </div>
 
     <!-- ניווט (מחשב) -->
     <nav class="hidden sm:flex gap-1 p-1 rounded-2xl bg-slate-100/80 dark:bg-white/5 mb-4 overflow-x-auto scroll-thin" aria-label="ניווט ראשי">
@@ -896,7 +907,7 @@ function canon(v) {
   return JSON.stringify(v === undefined ? null : v);
 }
 const Sync = {
-  status: 'local', ready: false, base: {}, remote: {}, got: { meta: false, months: false }, def: { meta: false, months: false },
+  status: 'local', ready: false, base: {}, remote: {},
   timer: null, writing: false, again: false, metaRef: null, monthsRef: null,
 
   setStatus(st) {
@@ -909,6 +920,9 @@ const Sync = {
     const pill = $('#syncPill'), mob = $('#syncPillMobile');
     if (pill) { pill.textContent = `${ic} ${tx}`; pill.classList.toggle('!text-rose-600', st === 'error'); }
     if (mob) mob.textContent = `${ic} ${tx}`;
+    const banner = $('#localBanner');
+    if (banner) banner.classList.toggle('hidden', st !== 'local');
+    if (st === 'synced' && pill) pill.title = 'סונכרן לאחרונה: ' + new Date().toLocaleTimeString('he-IL') + ' · לחצו לסנכרון עכשיו';
     const f = $('#footerStore');
     if (f) f.textContent = st === 'local'
       ? 'הנתונים נשמרים מקומית בדפדפן שלך בלבד. מומלץ לייצא גיבוי מדי פעם.'
@@ -935,21 +949,80 @@ const Sync = {
       this.metaRef = db.doc('data/users/' + uid + '/meta');
       this.monthsRef = this.metaRef.collection('months');
     } catch (e) { console.error(e); this.setStatus('local'); return; }
+    // קריאה ישירה מהשרת לפני ההרשמה לעדכונים, כדי להחליט נכון מה מקור האמת
+    if (!(await this.fetchRemote())) { this.setStatus('error'); return; }
+    this.firstMerge();
     this.metaRef.onSnapshot(s => this.onMeta(s), e => this.onError(e));
     this.monthsRef.onSnapshot(s => this.onMonths(s), e => this.onError(e));
+  },
+
+  async fetchRemote() {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const [m, q] = await Promise.all([this.metaRef.get(), this.monthsRef.get()]);
+        const remote = {};
+        if (m.exists) remote.meta = canon(m.data());
+        q.docs.forEach(d => { remote['m:' + d.id] = canon(d.data()); });
+        this.remote = remote;
+        return true;
+      } catch (e) {
+        console.error('sync read', e);
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+    return false;
+  },
+
+  /* חיבור ראשון בכל פתיחה: איחוד מה שיש בענן עם מה שנשמר במכשיר (אף פריט לא הולך לאיבוד) */
+  firstMerge() {
+    this.ready = true;
+    const remoteEmpty = !Object.keys(this.remote).length;
+    if (remoteEmpty) { this.base = {}; this.flush(); return; }
+    const rd = this.docsToData(this.remote);
+    const unionById = (target, source) => { const ids = new Set(target.map(x => x.id)); let n = 0; source.forEach(x => { if (!ids.has(x.id)) { target.push(x); ids.add(x.id); n++; } }); return n; };
+    unionById(rd.cards, Store.cards);
+    const ids = new Set(rd.cards.map(c => c.id));
+    const added = unionById(rd.transactions, Store.transactions.map(t => normalizeTx(t, ids)));
+    unionById(rd.investments, Store.investments);
+    unionById(rd.goals, Store.goals);
+    for (const k in Store.settings.budgets) if (!rd.settings.budgets[k]) rd.settings.budgets[k] = Store.settings.budgets[k];
+    for (const k in Store.settings.customSubs) {
+      const cur = rd.settings.customSubs[k] = rd.settings.customSubs[k] || [];
+      Store.settings.customSubs[k].forEach(x => { if (!cur.includes(x)) cur.push(x); });
+    }
+    Store.apply(rd);
+    Store.saveLocal();
+    this.base = { ...this.remote };
+    render();
+    if (added) toast(`${added} תנועות שנשמרו רק במכשיר הזה נוספו לסנכרון`, 'info');
+    this.flush();
+  },
+
+  docsToData(map) {
+    let meta = {};
+    try { meta = map.meta ? JSON.parse(map.meta) : {}; } catch (e) { meta = {}; }
+    const txs = [];
+    for (const k in map) if (k.startsWith('m:')) { try { txs.push(...(JSON.parse(map[k]).txs || [])); } catch (e) { /* מסמך פגום */ } }
+    return normalizeData({ version: 2, transactions: txs, cards: Array.isArray(meta.cards) ? meta.cards : Store.cards,
+      investments: meta.investments || [], goals: meta.goals || [], settings: meta.settings || Store.settings });
+  },
+
+  async forceSync() {
+    if (!this.ready) { toast(this.status === 'local' ? 'הגרסה הזו לא מחוברת לסנכרון' : 'עדיין מתחבר…', 'info'); return; }
+    this.setStatus('syncing');
+    if (await this.fetchRemote()) { this.reconcile(); await this.flush(); toast('הנתונים סונכרנו'); }
+    else this.setStatus('error');
   },
 
   onMeta(snap) {
     if (snap.metadata.hasPendingWrites) return;
     if (snap.exists) this.remote.meta = canon(snap.data()); else delete this.remote.meta;
-    this.got.meta = true; if (!snap.metadata.fromCache) this.def.meta = true;
     this.reconcile();
   },
   onMonths(qs) {
     if (qs.metadata.hasPendingWrites) return;
     for (const k of Object.keys(this.remote)) if (k.startsWith('m:')) delete this.remote[k];
     qs.docs.forEach(d => { this.remote['m:' + d.id] = canon(d.data()); });
-    this.got.months = true; if (!qs.metadata.fromCache) this.def.months = true;
     this.reconcile();
   },
   onError(e) {
@@ -958,15 +1031,8 @@ const Sync = {
   },
 
   reconcile() {
-    if (!this.got.meta || !this.got.months) return;
+    if (!this.ready) return;
     const L = this.local();
-    if (!this.ready) {
-      if (!this.def.meta || !this.def.months) return; // מחכים לתשובה ודאית מהשרת
-      this.ready = true;
-      const remoteEmpty = !Object.keys(this.remote).length;
-      if (remoteEmpty) { this.base = {}; this.flush(); return; } // ענן ריק – מעלים את מה שיש במכשיר
-      this.base = { ...L }; // הענן הוא המקור: כל הבדל מוחל מהענן
-    }
     const keys = new Set([...Object.keys(this.remote), ...Object.keys(this.base)]);
     const next = { ...L };
     let changed = false, localAhead = false;
@@ -981,14 +1047,8 @@ const Sync = {
   },
 
   applyDocs(map) {
-    let meta = {};
-    try { meta = map.meta ? JSON.parse(map.meta) : {}; } catch (e) { meta = {}; }
-    const txs = [];
-    for (const k in map) if (k.startsWith('m:')) { try { txs.push(...(JSON.parse(map[k]).txs || [])); } catch (e) { /* מסמך פגום */ } }
     try {
-      const data = normalizeData({ version: 2, transactions: txs, cards: Array.isArray(meta.cards) ? meta.cards : Store.cards,
-        investments: meta.investments || [], goals: meta.goals || [], settings: meta.settings || Store.settings });
-      Store.apply(data);
+      Store.apply(this.docsToData(map));
       Store.saveLocal();
       render();
     } catch (e) { console.error(e); }
@@ -2949,6 +3009,9 @@ function bindEvents() {
   $('#importFile').addEventListener('change', e => { importData(e.target.files[0]); e.target.value = ''; });
 
   $('#copyRecurring').addEventListener('click', copyRecurring);
+  $('#syncPill').addEventListener('click', () => Sync.forceSync());
+  $('#syncPillMobile').addEventListener('click', () => Sync.forceSync());
+  $('#bannerExport').addEventListener('click', exportData);
   $('#themeToggle').addEventListener('click', toggleTheme);
 
   document.addEventListener('keydown', e => {
