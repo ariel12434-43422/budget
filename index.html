@@ -9,10 +9,11 @@
   <script>
     (function () {
       try {
-        var saved = localStorage.getItem('budget-theme');
-        var dark = saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
-        if (dark) document.documentElement.classList.add('dark');
-      } catch (e) { /* localStorage חסום */ }
+        var root = document.documentElement, attr = root.getAttribute('data-theme'), saved = null;
+        try { saved = localStorage.getItem('budget-theme'); } catch (e) { /* localStorage חסום */ }
+        var dark = attr ? attr === 'dark' : saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        if (dark) root.classList.add('dark');
+      } catch (e) { /* מתעלמים */ }
     })();
   </script>
 
@@ -102,11 +103,12 @@
         </div>
         <div class="min-w-0">
           <h1 class="text-xl sm:text-2xl font-extrabold tracking-tight truncate">התקציב שלי – אריאל אורגד</h1>
-          <p class="text-xs text-slate-500 dark:text-slate-400 truncate">הכנסות · הוצאות · אשראי · השקעות ויעדים</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 truncate"><span id="syncPillMobile" class="sm:hidden"></span><span class="hidden sm:inline">הכנסות · הוצאות · אשראי · השקעות ויעדים</span></p>
         </div>
       </div>
 
       <div class="flex items-center gap-1 sm:gap-2">
+        <span id="syncPill" class="hidden sm:inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 dark:bg-white/10 dark:text-slate-300" title="מצב סנכרון" role="status"></span>
         <button id="themeToggle" class="icon-btn" aria-label="החלפת מצב כהה/בהיר" title="מצב כהה/בהיר">
           <span data-icon="moon" class="dark:hidden"></span>
           <span data-icon="sun" class="hidden dark:inline"></span>
@@ -290,7 +292,7 @@
     </section>
 
     <footer class="text-center text-xs text-slate-400 mt-8">
-      הנתונים נשמרים מקומית בדפדפן שלך בלבד. מומלץ לייצא גיבוי מדי פעם. החישובים וההמלצות הם כלי עזר ואינם ייעוץ פיננסי.
+      <span id="footerStore">הנתונים נשמרים מקומית בדפדפן שלך בלבד. מומלץ לייצא גיבוי מדי פעם.</span> החישובים וההמלצות הם כלי עזר ואינם ייעוץ פיננסי.
     </footer>
   </div>
 
@@ -647,13 +649,27 @@ function hydrateIcons(root = document) {
   });
 }
 
-function downloadFile(name, content, type) {
+async function downloadFile(name, content, type) {
+  const dl = await claudeCap('downloads');
+  if (dl) {
+    try { await dl.save({ filename: name, data: content }); return true; }
+    catch (e) { if (e && e.code === 'declined') return false; toast('השמירה לא הושלמה – נסו שוב', 'error'); return false; }
+  }
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return true;
+}
+
+/* גישה ליכולות של Claude (כשהאפליקציה פתוחה ב-claude.ai); מחוץ ל-Claude מחזיר null */
+function claudeCap(name) {
+  try {
+    if (window.claude && typeof window.claude.use === 'function') return window.claude.use(name).catch(() => null);
+  } catch (e) { /* מתעלמים */ }
+  return Promise.resolve(null);
 }
 
 /* =========================================================
@@ -823,7 +839,7 @@ const Store = {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return;
       this.apply(normalizeData(JSON.parse(raw)));
-      this.save(); // שמירה במבנה החדש לאחר הגירה
+      this.saveLocal(); // שמירה במבנה החדש לאחר הגירה
     } catch (e) {
       console.error('שגיאה בטעינת הנתונים', e);
       setTimeout(() => toast('לא ניתן היה לטעון את הנתונים השמורים', 'error'), 300);
@@ -836,9 +852,10 @@ const Store = {
   snapshot() {
     return { app: 'budget-app', version: 2, transactions: this.transactions, cards: this.cards, investments: this.investments, goals: this.goals, settings: this.settings };
   },
-  save() {
+  save() { this.saveLocal(); Sync.schedule(); },
+  saveLocal() {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(this.snapshot())); }
-    catch (e) { console.error(e); toast('השמירה בדפדפן נכשלה – מומלץ לייצא גיבוי', 'error'); }
+    catch (e) { if (!Sync.ready) { console.error(e); toast('השמירה בדפדפן נכשלה – מומלץ לייצא גיבוי', 'error'); } }
   },
   cardIds() { return new Set(this.cards.map(c => c.id)); },
   addTx(tx) { const n = normalizeTx({ ...tx, id: uid(), createdAt: Date.now() }, this.cardIds()); this.transactions.push(n); this.save(); return n; },
@@ -859,6 +876,162 @@ const Store = {
   addCustomSub(cat, name) {
     if (this.subsOf(cat).includes(name)) return;
     (this.settings.customSubs[cat] = this.settings.customSubs[cat] || []).push(name);
+  }
+};
+
+
+/* =========================================================
+   4א. סנכרון בין מכשירים (פעיל כשהאפליקציה פתוחה ב-claude.ai)
+   ---------------------------------------------------------
+   הנתונים נשמרים במסמכים פרטיים של המשתמש:
+   data/users/<id>/meta           – כרטיסים, השקעות, יעדים והגדרות
+   data/users/<id>/meta/months/YYYY-MM – התנועות של כל חודש
+   מיזוג תלת-כיווני לכל מסמך (מקומי / מרוחק / בסיס משותף):
+   שינוי מקומי נדחף, שינוי מרוחק מוחל, ובהתנגשות על אותו מסמך המקומי גובר.
+   ========================================================= */
+const EMPTY_MONTH = JSON.stringify({ txs: [] });
+function canon(v) {
+  if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
+  return JSON.stringify(v === undefined ? null : v);
+}
+const Sync = {
+  status: 'local', ready: false, base: {}, remote: {}, got: { meta: false, months: false }, def: { meta: false, months: false },
+  timer: null, writing: false, again: false, metaRef: null, monthsRef: null,
+
+  setStatus(st) {
+    this.status = st;
+    const map = {
+      local: ['💾', 'שמור במכשיר זה'], connecting: ['⏳', 'מתחבר לסנכרון…'], syncing: ['🔄', 'מסנכרן…'],
+      synced: ['☁️', 'מסונכרן'], error: ['⚠️', 'שגיאת סנכרון']
+    };
+    const [ic, tx] = map[st] || map.local;
+    const pill = $('#syncPill'), mob = $('#syncPillMobile');
+    if (pill) { pill.textContent = `${ic} ${tx}`; pill.classList.toggle('!text-rose-600', st === 'error'); }
+    if (mob) mob.textContent = `${ic} ${tx}`;
+    const f = $('#footerStore');
+    if (f) f.textContent = st === 'local'
+      ? 'הנתונים נשמרים מקומית בדפדפן שלך בלבד. מומלץ לייצא גיבוי מדי פעם.'
+      : 'הנתונים נשמרים בחשבון Claude שלך ומסתנכרנים בין כל המכשירים. רק אתה רואה אותם.';
+  },
+
+  local() {
+    const out = { meta: canon({ cards: Store.cards, investments: Store.investments, goals: Store.goals, settings: Store.settings }) };
+    const months = {};
+    for (const t of Store.transactions) (months[t.date.slice(0, 7)] = months[t.date.slice(0, 7)] || []).push(t);
+    for (const k in months) out['m:' + k] = canon({ txs: months[k].sort((a, b) => (a.id < b.id ? -1 : 1)) });
+    return out;
+  },
+  val(map, k) { return map[k] !== undefined ? map[k] : (k === 'meta' ? null : EMPTY_MONTH); },
+
+  async init() {
+    const [db, user] = await Promise.all([claudeCap('db'), claudeCap('user')]);
+    if (!db || !user) { this.setStatus('local'); return; }
+    let uid = null;
+    try { uid = await user.id(); } catch (e) { uid = null; }
+    if (!uid) { this.setStatus('local'); return; }
+    this.setStatus('connecting');
+    try {
+      this.metaRef = db.doc('data/users/' + uid + '/meta');
+      this.monthsRef = this.metaRef.collection('months');
+    } catch (e) { console.error(e); this.setStatus('local'); return; }
+    this.metaRef.onSnapshot(s => this.onMeta(s), e => this.onError(e));
+    this.monthsRef.onSnapshot(s => this.onMonths(s), e => this.onError(e));
+  },
+
+  onMeta(snap) {
+    if (snap.metadata.hasPendingWrites) return;
+    if (snap.exists) this.remote.meta = canon(snap.data()); else delete this.remote.meta;
+    this.got.meta = true; if (!snap.metadata.fromCache) this.def.meta = true;
+    this.reconcile();
+  },
+  onMonths(qs) {
+    if (qs.metadata.hasPendingWrites) return;
+    for (const k of Object.keys(this.remote)) if (k.startsWith('m:')) delete this.remote[k];
+    qs.docs.forEach(d => { this.remote['m:' + d.id] = canon(d.data()); });
+    this.got.months = true; if (!qs.metadata.fromCache) this.def.months = true;
+    this.reconcile();
+  },
+  onError(e) {
+    console.error('sync', e);
+    this.setStatus(e && (e.code === 'revoked' || e.code === 'not_granted') ? 'local' : 'error');
+  },
+
+  reconcile() {
+    if (!this.got.meta || !this.got.months) return;
+    const L = this.local();
+    if (!this.ready) {
+      if (!this.def.meta || !this.def.months) return; // מחכים לתשובה ודאית מהשרת
+      this.ready = true;
+      const remoteEmpty = !Object.keys(this.remote).length;
+      if (remoteEmpty) { this.base = {}; this.flush(); return; } // ענן ריק – מעלים את מה שיש במכשיר
+      this.base = { ...L }; // הענן הוא המקור: כל הבדל מוחל מהענן
+    }
+    const keys = new Set([...Object.keys(this.remote), ...Object.keys(this.base)]);
+    const next = { ...L };
+    let changed = false, localAhead = false;
+    for (const k of keys) {
+      const R = this.val(this.remote, k), B = this.val(this.base, k), Lk = this.val(L, k);
+      if (R === Lk) { if (R === null) delete this.base[k]; else this.base[k] = R; continue; }
+      if (R !== B && Lk === B) { if (R === null) delete next[k]; else next[k] = R; this.base[k] = R; changed = true; }
+      else if (Lk !== B) localAhead = true;
+    }
+    if (changed) this.applyDocs(next);
+    if (localAhead) this.schedule(); else if (!this.writing && !this.timer) this.setStatus('synced');
+  },
+
+  applyDocs(map) {
+    let meta = {};
+    try { meta = map.meta ? JSON.parse(map.meta) : {}; } catch (e) { meta = {}; }
+    const txs = [];
+    for (const k in map) if (k.startsWith('m:')) { try { txs.push(...(JSON.parse(map[k]).txs || [])); } catch (e) { /* מסמך פגום */ } }
+    try {
+      const data = normalizeData({ version: 2, transactions: txs, cards: Array.isArray(meta.cards) ? meta.cards : Store.cards,
+        investments: meta.investments || [], goals: meta.goals || [], settings: meta.settings || Store.settings });
+      Store.apply(data);
+      Store.saveLocal();
+      render();
+    } catch (e) { console.error(e); }
+  },
+
+  schedule() {
+    if (!this.ready) return;
+    clearTimeout(this.timer);
+    this.setStatus('syncing');
+    this.timer = setTimeout(() => { this.timer = null; this.flush(); }, 700);
+  },
+
+  async flush() {
+    if (!this.ready) return;
+    if (this.writing) { this.again = true; return; }
+    this.writing = true;
+    this.setStatus('syncing');
+    let failed = false;
+    try {
+      const L = this.local();
+      const keys = new Set([...Object.keys(L), ...Object.keys(this.base)]);
+      for (const k of keys) {
+        const Lk = this.val(L, k);
+        if (Lk === this.val(this.base, k) || Lk === null) continue;
+        const ref = k === 'meta' ? this.metaRef : this.monthsRef.doc(k.slice(2));
+        try { await ref.set(JSON.parse(Lk)); }
+        catch (e) {
+          if (e && e.code === 'unavailable') { await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000)); await ref.set(JSON.parse(Lk)); }
+          else throw e;
+        }
+        this.base[k] = Lk;
+      }
+    } catch (e) {
+      failed = true;
+      console.error('sync write', e);
+      this.setStatus('error');
+      if (e && e.code === 'quota_exceeded') toast('נגמר המקום לסנכרון. ייצאו גיבוי ומחקו תנועות ישנות.', 'error');
+      else if (e && e.code === 'invalid_argument') toast('אין הרשאה לשמור בענן מהחשבון הזה – הנתונים נשמרים במכשיר בלבד', 'error');
+      else toast('הסנכרון נכשל זמנית – ננסה שוב בשינוי הבא', 'error');
+    }
+    this.writing = false;
+    if (this.again) { this.again = false; return this.flush(); }
+    if (!failed) this.setStatus('synced');
   }
 };
 
@@ -2452,12 +2625,12 @@ function handleTxSubmit(e) {
 /* =========================================================
    18. ייבוא, ייצוא ונתוני דוגמה
    ========================================================= */
-function exportData() {
-  downloadFile(`budget-backup-${D.key(D.today())}.json`, JSON.stringify({ ...Store.snapshot(), exportedAt: new Date().toISOString() }, null, 2), 'application/json');
-  toast(`יוצאו ${Store.transactions.length} תנועות, ${Store.investments.length} השקעות ו-${Store.goals.length} יעדים`);
+async function exportData() {
+  const ok = await downloadFile(`budget-backup-${D.key(D.today())}.json`, JSON.stringify({ ...Store.snapshot(), exportedAt: new Date().toISOString() }, null, 2), 'application/json');
+  if (ok) toast(`יוצאו ${Store.transactions.length} תנועות, ${Store.investments.length} השקעות ו-${Store.goals.length} יעדים`);
 }
 
-function exportCSV() {
+async function exportCSV() {
   const rows = [['תאריך', 'סוג', 'קבוצה', 'קטגוריה', 'תת-קטגוריה', 'תיאור', 'סכום', 'אמצעי תשלום', 'תשלומים', 'קבועה']];
   Store.transactions.slice().sort((a, b) => a.date.localeCompare(b.date)).forEach(t => {
     const c = CATEGORIES[t.category];
@@ -2465,8 +2638,7 @@ function exportCSV() {
       t.amount, t.type === 'expense' ? paymentLabel(t.payment).replace(/^\S+\s/, '') : '', t.installments, t.recurring ? 'כן' : '']);
   });
   const csv = '﻿' + rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
-  downloadFile(`budget-transactions-${D.key(D.today())}.csv`, csv, 'text/csv;charset=utf-8');
-  toast('קובץ CSV יוצא – אפשר לפתוח אותו באקסל');
+  if (await downloadFile(`budget-transactions-${D.key(D.today())}.csv`, csv, 'text/csv;charset=utf-8')) toast('קובץ CSV יוצא – אפשר לפתוח אותו באקסל');
 }
 
 function importData(file) {
@@ -2790,7 +2962,7 @@ function bindEvents() {
     if (!typing && !$$('.modal.show').length && (e.key === 'n' || e.key === 'מ') && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); form.open(); }
   });
 
-  window.addEventListener('storage', e => { if (e.key === STORAGE_KEY) { Store.load(); render(); } });
+  window.addEventListener('storage', e => { if (e.key === STORAGE_KEY && !Sync.ready) { Store.load(); render(); } });
 }
 
 function init() {
@@ -2798,7 +2970,16 @@ function init() {
   UI.load();
   Store.load();
   bindEvents();
+  Sync.setStatus('local');
   render();
+  Sync.init();
+  // מעקב אחרי ערכת הנושא של Claude (data-theme) כשהאפליקציה פתוחה שם
+  new MutationObserver(() => {
+    const t = document.documentElement.getAttribute('data-theme');
+    if (!t) return;
+    const dark = t === 'dark';
+    if (document.documentElement.classList.contains('dark') !== dark) { document.documentElement.classList.toggle('dark', dark); render(); }
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 }
 
 document.addEventListener('DOMContentLoaded', init);
